@@ -3,7 +3,8 @@ ISP-55e0 - An ISP flashing tool for the WCH CH55x, CH57x and CH32Fx
 
 This tool is meant to flash the WinChipHead CH55x / CH57x / CH32Fx
 series, such as the CH551, CH552, CH554, CH559 or CH579, through USB
-or serial port on Linux.
+or a serial port. Serial backends are provided for Windows (Win32 COM API)
+and POSIX systems (termios). USB uses libusb.
 
 When set in ISP mode, the chip creates a 4348:55e0 USB device, hence
 the name for that project.
@@ -36,7 +37,13 @@ isp55e0 has been tested on:
 |CH573       |2.8.0     |+  |      |
 |CH579       |2.8.0     |+  |      |
 |CH582       |2.4.0     |+  |+     |
-|CH583       |2.4.0     |+  |      |
+|CH583       |2.4.0     |+  |+     |
+|CH591       |2.3.0     |+  |+     |
+|CH592       |2.3.0     |+  |+     |
+|CH584       |2.3.0     |+  |+     |
+|CH58X       |2.4.0     |+  |+     |
+|CH585       |2.3.0     |+  |+     |
+|CH587       |2.4.0     |+  |+     |
 |CH32F103C8T6|2.3.1     |+  |      |
 |CH32F103C8T6|2.5.0     |+  |      |
 |CH32V103C8T6|2.6.0     |+  |      |
@@ -61,6 +68,31 @@ Build it without libusb:
 
 >  make WITHOUT_USB=1
 
+### Windows / MinGW64
+
+In an MSYS2 MinGW64 shell with GCC, GNU make and the MinGW64 libusb
+package installed:
+
+```bash
+mingw32-make CC=gcc
+# Serial-only build, without a libusb dependency:
+mingw32-make CC=gcc WITHOUT_USB=1
+# Hardware-independent UART framing tests:
+mingw32-make CC=gcc test
+# CLI validation (run against the serial-only executable):
+mingw32-make CC=gcc WITHOUT_USB=1
+python -I tests/test_cli.py ./isp55e0.exe
+```
+
+The compiler target selects `transfer_uart_windows.c` or
+`transfer_uart_posix.c` automatically. USB-enabled builds also compile
+`transfer_usb_libusb.c`. Build variants have separate object directories;
+cleaning is not required when switching `WITHOUT_USB`.
+
+A USB-enabled executable requires libusb and its runtime dependencies.
+The USB device must use a driver supported by libusb. Serial-only builds
+use the Windows COM API and do not need libusb.
+
 ### macOS
 
 1. install `libusb`
@@ -72,7 +104,7 @@ Build it without libusb:
 2. build
 
    ```bash
-   clang -O2 -Wall -Werror -I /opt/homebrew/include -L /opt/homebrew/lib -lusb-1.0 -o isp55e0 isp55e0.c
+   make CC=clang CPPFLAGS="-I/opt/homebrew/include" LDFLAGS="-L/opt/homebrew/lib"
    ```
 
 UDEV configuration
@@ -96,19 +128,95 @@ Help:
 
   ISP programmer for some WinChipHead MCUs
   Options:
-    --port, -p          use serial port instead of usb
+    --port, -p          serial port (COM3 or /dev/ttyUSB0)
+    --transport, -t     backend: uart or libusb (default: auto)
     --code-flash, -f    firmware to flash
     --code-verify, -c   verify existing firwmare
     --data-flash, -k    data to flash
     --data-verify, -l   verify existing data
     --data-dump, -m     dump the data flash to a file
     --debug, -d         turn debug traces on
-    --speed, -s         UART speed [115200,230400,460800,500000,921600,1000000,2000000]
+    --speed, -s         UART baudrate, any positive value the adapter supports (default 115200)
     --user-config, -u   User-level Configuration, e.g. 4d
     --write-protection-config, -w Write-Protection Cfg., e.g. ffffffff
     --version, -v       version
     --help, -h          this help
 ```
+
+### Selecting a transport
+
+Without `--transport`, specifying `--port` selects UART; otherwise libusb
+is selected. An explicit backend can be selected with `--transport uart`
+or `--transport libusb`.
+
+```bash
+# Windows: query over a serial port (COM10 and higher are supported too)
+./isp55e0.exe --port COM3
+# Windows: flash over UART, switching from the initial 115200 baud
+./isp55e0.exe --port COM10 --speed 921600 --code-flash fw.bin
+# POSIX
+./isp55e0 --port /dev/ttyUSB0 --speed 230400 --code-flash fw.bin
+# USB
+./isp55e0 --transport libusb --code-flash fw.bin
+```
+
+UART opens at 115200 baud, 8N1, no flow control. Windows disables DTR/RTS;
+the POSIX backend does not explicitly change their line states. Drivers may
+still change these signals when a port is opened or closed.
+`--speed` accepts any positive integer; it sends the ISP baud-change
+command before changing the host serial rate. A successful session
+restores 115200 before reboot/close. On failure the port is closed, but
+the MCU may need resetting to restore its initial baudrate. Whether a
+given rate actually works is decided at runtime by the host serial
+driver: Windows forwards the rate to the driver, Linux uses the BOTHER
+extension for non-standard rates (common architectures), and macOS uses
+plain numeric speeds.
+`--speed` is only valid with UART.
+
+### UART baud rates
+
+The tool accepts any positive number for `--speed`, but the rate that
+actually works is limited by **every link in the chain**: the MCU's ISP
+bootloader, the USB-to-UART bridge (or other serial hardware), and its
+driver. The effective maximum is the lowest of them all.
+
+Examples:
+
+| Component | Maximum UART baud |
+|-----------|-------------------|
+| CH32V20x ISP bootloader | 6000000 |
+| CH592 ISP bootloader | 6000000 |
+| CH9102 USB-to-UART bridge | 6000000 |
+| CH340 USB-to-UART bridge | 2000000 |
+
+So even though a CH32V20x or CH592 can be programmed at 6 Mbaud, going
+through a classic CH340 bridge caps the link at 2 Mbaud; use a bridge in
+the same class as the chip (for example a CH9102) to reach the chip's
+full rate. Older chip families also top out lower than the figures above.
+
+If a rate is refused by the device, or communication times out after the
+switch, reset or power-cycle the board: the bootloader returns to its
+default 115200 baud after reset.
+
+### Transport implementation
+
+- `transfer.h` / `transfer.c`: backend operations, selection and debug tracing.
+- `transfer_uart.c`: shared UART framing and checksum validation.
+- `transfer_uart_windows.c`: Windows COM configuration and timed I/O.
+- `transfer_uart_posix.c`: termios configuration and poll-based I/O.
+- `transfer_usb_libusb.c`: USB discovery, interface claim and bulk transfers.
+
+ISP command structures and baud-change commands remain in the protocol
+layer; backends exchange unframed ISP request/response payloads. Each
+backend owns its private handle in `transport.context` and returns zero
+or a negative errno value, with diagnostics in `transport.error`.
+
+To add a WCH-driver backend later, implement `transfer_usb_wch.c` with a
+`const struct transport_ops transfer_usb_wch_ops`, register it in the
+backend table in `transfer.c`, and add its build flags/libraries to the
+Makefile. It can then be selected by its backend name without changing
+ISP commands. No WCH DLL/API implementation is included yet; the exact
+supported driver/device API must be established first.
 
 Query the device:
 

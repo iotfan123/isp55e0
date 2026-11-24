@@ -1,16 +1,8 @@
-/* Endpoints to use */
-#define EP_OUT 0x02
-#define EP_IN 0x82
-
 #define XOR_KEY_LEN 8
 
 #define ARRAY_SIZE(X) (sizeof(X)/sizeof(X[0]))
 
-/* Serial port wrapper magics */
-#define SERIAL_REQ_MAGIC1 (0x57)
-#define SERIAL_REQ_MAGIC2 (0xAB)
-#define SERIAL_RESP_MAGIC1 (0x55)
-#define SERIAL_RESP_MAGIC2 (0xAA)
+struct transport;
 
 /* Profile of a specific CH device */
 struct ch_profile {
@@ -38,12 +30,6 @@ struct content {
 	uint8_t *buf;
 };
 
-struct baudrate
-{
-	uint32_t baudrate;
-	uint32_t baud_param_ioterm;
-};
-
 /* Current device */
 struct device {
 	const struct ch_profile *profile;
@@ -51,23 +37,19 @@ struct device {
 	struct content fw;
 	struct content data;	/* read data from */
 	struct content data_dump; /* write the data flash into */
-#if(!defined(WITHOUT_USB) || (WITHOUT_USB == 0))
-	libusb_device_handle *usb_h;
-#endif
+	struct transport *transport;
 	uint32_t bv;		/* bootloader version */
+	uint8_t type;
+	uint8_t family;
 	uint8_t id[8];
 	uint8_t config_data[12];
 	bool upd_cfg_user_bits;
 	bool upd_protection_bits;
 	bool upd_baudrate;
-	struct baudrate baud;
 	uint8_t cfg_user_bits;
 	uint32_t cfg_protection_bits;
 	uint8_t xor_key[XOR_KEY_LEN];
 	bool wait_reboot_resp;	/* wait for reboot command response */
-#ifndef WIN32
-        int fd; /* serial port descriptor */
-#endif
 };
 
 /* Percentage display */
@@ -78,10 +60,6 @@ struct percentage {
 	bool is_cr;
 	bool is_dot;
 };
-
-/* Enough to erase the flash. */
-#define USB_TIMEOUT 5000 // milliseconds
-#define SERIAL_TIMEOUT 10 // deciseconds
 
 #define CMD_CHIP_TYPE        0xa1
 #define CMD_REBOOT           0xa2

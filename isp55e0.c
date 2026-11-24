@@ -29,15 +29,13 @@
 #include <fcntl.h>
 #include <errno.h>
 
-#ifdef WIN32
+#ifdef _WIN32
 #include "compat-err.h"
 
 #define be32toh _byteswap_ulong
 
 #else
 #include <err.h>
-#include <termios.h>
-#include <sys/ioctl.h>
 #endif
 
 #ifdef __APPLE__
@@ -46,10 +44,7 @@
 #define be32toh OSSwapBigToHostInt32
 #endif
 
-#if (!defined(WITHOUT_USB) || (WITHOUT_USB == 0))
-#include <libusb-1.0/libusb.h>
-#endif
-
+#include "transfer.h"
 #include "isp55e0.h"
 #include "version.h"
 
@@ -68,23 +63,11 @@ static const struct option long_options[] = {
 	{ "data-verify", required_argument, 0,  'l' },
 	{ "data-dump", required_argument, 0,  'm' },
 	{ "user-config", required_argument, 0, 'u' },
-	{ "speed", required_argument, 0, 's' },
 	{ "write-protection-config", required_argument, 0, 'w' },
-#ifndef WIN32
-	{ "port", required_argument, 0,  'p' },
-#endif
+	{ "speed", required_argument, 0, 's' },
+	{ "port", required_argument, 0, 'p' },
+	{ "transport", required_argument, 0, 't' },
 	{ 0, 0, 0, 0 }
-};
-
-#define BAUDRATE_DEFAULT B115200
-
-static const struct baudrate baudrates[] = {
-	{ 230400, B230400 },
-	{ 460800, B460800 },
-	{ 500000, B500000 },
-	{ 921600, B921600 },
-	{ 1000000, B1000000 },
-	{ 2000000, B2000000 }
 };
 
 static int transfer(struct device *dev, void *req, int req_len,
@@ -94,35 +77,19 @@ static void usage(void)
 {
 	printf("ISP programmer [version %s] for some WinChipHead MCUs\n", PACKAGE_VERSION);
 	printf("Options:\n");
-#ifndef WIN32
-	printf("  --port, -p          use serial port instead of usb\n");
-#endif
+	printf("  --port, -p          serial port (COM3 or /dev/ttyUSB0)\n");
+	printf("  --transport, -t     backend: uart or libusb (default: auto)\n");
 	printf("  --code-flash, -f    firmware to flash\n");
 	printf("  --code-verify, -c   verify existing firmware\n");
 	printf("  --data-flash, -k    data to flash\n");
 	printf("  --data-verify, -l   verify existing data\n");
 	printf("  --data-dump, -m     dump the data flash to a file\n");
 	printf("  --debug, -d         turn debug traces on\n");
-	printf("  --speed, -s         UART speed [115200,230400,460800,500000,921600,1000000,2000000]\n");
+	printf("  --speed, -s         UART baudrate, any positive value the adapter supports (default 115200)\n");
 	printf("  --user-config, -u   User-level Configuration, e.g. 4d\n");
 	printf("  --write-protection-config, -w Write-Protection Cfg., e.g. ffffffff\n");
 	printf("  --version, -v       show the version\n");
 	printf("  --help, -h          this help\n");
-}
-
-static void hexdump(const char *name, const void *data, int len)
-{
-	const uint8_t *p = data;
-	int i;
-
-	printf("Dump - %s\n", name);
-	for (i = 0; i < len; i++) {
-		if (i && (i % 16) == 0)
-			printf("\n");
-
-		printf("%02x ", *p++);
-	}
-	printf("\n");
 }
 
 static void hexdump_line(const char *name, const void *data, int len)
@@ -165,83 +132,29 @@ static int percentage_inc(struct percentage *p, int value)
 	return 0;
 }
 
-#ifndef WIN32
-static void open_serial_device(struct device *dev, char *port)
+/* ISP commands remain independent of the selected transport backend. */
+static struct transport connection;
+
+static void close_connection(void)
 {
-	int ret;
-	struct termios options;
-	int status;
-	speed_t baud = B115200;
-
-	if ((dev->fd = open(port, O_RDWR | O_NOCTTY)) == -1)
-		errx(EXIT_FAILURE, "Error occurred while opening serial port '%s'", port);
-
-	ret = fcntl(dev->fd, F_SETFL, O_RDWR) ;
-	if (ret < 0)
-		goto fail;
-
-	ret = tcgetattr(dev->fd, &options);
-	if (ret < 0)
-		goto fail;
-
-	cfmakeraw(&options);
-
-	ret = cfsetispeed(&options, baud);
-	if (ret < 0)
-		goto fail;
-
-	ret = cfsetospeed(&options, baud);
-	if (ret < 0)
-		goto fail;
-
-	options.c_cflag |= (CLOCAL | CREAD) ;
-	options.c_cflag &= ~(PARENB | CSTOPB | CSIZE) ;
-	options.c_cflag |= CS8 ;
-	options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG) ;
-	options.c_oflag &= ~OPOST ;
-	/* Turn off s/w flow ctrl */
-	options.c_iflag &= ~(IXON | IXOFF | IXANY);
-	/* Disable any special handling of received bytes */
-	options.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
-
-	options.c_cc [VMIN]  = 64;
-	options.c_cc [VTIME] = SERIAL_TIMEOUT;
-
-	ret = tcsetattr(dev->fd, TCSANOW, &options) ;
-	if (ret < 0)
-		goto fail;
-
-	ret = ioctl(dev->fd, TIOCMGET, &status);
-	if (ret < 0)
-		goto fail;
-
-	status |= TIOCM_DTR;
-	status |= TIOCM_RTS;
-
-	ret = ioctl(dev->fd, TIOCMSET, &status);
-	if (ret < 0)
-		goto fail;
-
-	return;
-fail:
-	errx(EXIT_FAILURE, "Error occurred while configuring serial port");
+	transport_close(&connection);
 }
 
-static unsigned char serial_crc(unsigned char *req, int req_len)
+static int transfer(struct device *dev, void *req, int req_len,
+		    void *resp, int resp_len)
 {
-	unsigned char crc = 0;
+	int ret = transport_exchange(dev->transport, req, req_len, resp, resp_len);
+	bool expected_silence = ((const struct req_hdr *)req)->command == CMD_REBOOT &&
+		!dev->wait_reboot_resp;
 
-	for(int i = 0; i < req_len; i++){
-		crc += req[i];
-	}
-
-	return crc;
+	if (ret && !expected_silence)
+		fprintf(stderr, "%s: %s\n", dev->transport->ops->name,
+			dev->transport->error[0] ? dev->transport->error : "Communication failed");
+	return ret;
 }
 
-static void change_uart_baudrate(struct device *dev)
+static void change_uart_baudrate(struct device *dev, uint32_t baud)
 {
-	uint32_t baud = dev->baud.baudrate;
-	uint32_t baud_param = dev->baud.baud_param_ioterm;
 	struct req_set_baudrate req = {
 		.hdr.command = CMD_SET_BAUD,
 		.hdr.data_len = sizeof(req) - sizeof(req.hdr),
@@ -251,130 +164,22 @@ static void change_uart_baudrate(struct device *dev)
 		.baud[3] = baud >> 24
 	};
 	struct resp_set_baudrate resp;
-	int ret;
 
-	printf("Set new baudrate=%d\n", baud);
-
-	ret = transfer(dev, &req, sizeof(req), &resp, sizeof(resp));
-	if (ret)
+	printf("Set new baudrate=%lu\n", (unsigned long)baud);
+	if (transfer(dev, &req, sizeof(req), &resp, sizeof(resp)))
 		errx(EXIT_FAILURE, "Can't set the device UART baudrate");
-
 	if (resp.return_code)
 		errx(EXIT_FAILURE, "The device refused to change baudrate");
-
-	struct termios options;
-	tcgetattr(dev->fd, &options);
-	cfsetispeed(&options, baud_param);
-	cfsetospeed(&options, baud_param);
-	tcsetattr(dev->fd, TCSANOW, &options);
-}
-#endif
-
-#if (!defined(WITHOUT_USB) || (WITHOUT_USB == 0))
-/* Open and claim the USB device */
-static void open_usb_device(struct device *dev)
-{
-	int ret;
-
-	ret = libusb_init(NULL);
-	if (ret)
-		errx(EXIT_FAILURE, "Can't initialize USB");
-
-	dev->usb_h = libusb_open_device_with_vid_pid(NULL, 0x4348, 0x55e0);
-	if (dev->usb_h == NULL)
-		dev->usb_h = libusb_open_device_with_vid_pid(NULL, 0x1a86, 0x55e0);
-	if (dev->usb_h == NULL)
-		errx(EXIT_FAILURE, "No CH5xx devices found in ISP mode");
-
-#ifndef WIN32
-	/* it seems WIN32 libusb doesn't support this */
-	ret = libusb_set_auto_detach_kernel_driver(dev->usb_h, 1);
-	if (ret)
-		errx(EXIT_FAILURE, "Can't detach the device from the kernel");
-#endif
-
-	ret = libusb_claim_interface(dev->usb_h, 0);
-	if (ret)
-		errx(EXIT_FAILURE, "Can't claim the USB device\n");
-}
-#endif
-
-/* Send a request, get a reply */
-static int transfer(struct device *dev, void *req, int req_len,
-		    void *resp, int resp_len)
-{
-#ifndef WIN32
-	int serial_transmitted;
-	unsigned char req_serial_prefix[2] = {SERIAL_REQ_MAGIC1, SERIAL_REQ_MAGIC2};
-	unsigned char req_serial_crc[1] = {serial_crc(req, req_len)};
-	unsigned char resp_serial_prefix[2];
-	unsigned char resp_serial_crc[1];
-
-	if (dev->fd) {
-		/* Serial port case */
-		serial_transmitted = write(dev->fd, req_serial_prefix, sizeof(req_serial_prefix));
-		serial_transmitted += write(dev->fd, req, req_len);
-		serial_transmitted += write(dev->fd, req_serial_crc, sizeof(req_serial_crc));
-
-		if (serial_transmitted != (sizeof(req_serial_prefix)+req_len+sizeof(req_serial_crc)))
-			errx(EXIT_FAILURE, "Serial port write error");
-
-		if (dev->debug)
-			hexdump("request", req, req_len);
-
-		serial_transmitted = read(dev->fd, resp_serial_prefix, sizeof(resp_serial_prefix));
-		if (serial_transmitted != sizeof(resp_serial_prefix) || resp_serial_prefix[0] != SERIAL_RESP_MAGIC1 || resp_serial_prefix[1] != SERIAL_RESP_MAGIC2)
-			errx(EXIT_FAILURE, "Serial port response magic read error");
-
-		serial_transmitted = read(dev->fd, resp, resp_len);
-		if (serial_transmitted != resp_len)
-			errx(EXIT_FAILURE, "Serial port response read error");
-
-		serial_transmitted = read(dev->fd, resp_serial_crc, sizeof(resp_serial_crc));
-		if (serial_transmitted != sizeof(resp_serial_crc) || resp_serial_crc[0] != serial_crc(resp, resp_len))
-			errx(EXIT_FAILURE, "Serial port response crc read error");
-
-		if (dev->debug)
-			hexdump("response", resp, resp_len);
-
-	} else {
-#endif
-
-#if (!defined(WITHOUT_USB) || (WITHOUT_USB == 0))
-		int len;
-		int ret;
-		/* USB case */
-		ret = libusb_bulk_transfer(dev->usb_h, EP_OUT, req, req_len,
-				   &len, USB_TIMEOUT);
-		if (ret)
-			return -EIO;
-
-		if (dev->debug)
-			hexdump("request", req, len);
-
-		ret = libusb_bulk_transfer(dev->usb_h, EP_IN, resp, resp_len,
-				   &len, USB_TIMEOUT);
-		if (ret)
-			return -EIO;
-
-		if (dev->debug)
-			hexdump("response", resp, len);
-#else
-	/* transfer to nowhere */
-	return -ENODEV;
-#endif
-
-#ifndef WIN32
-	}
-#endif
-
-	return 0;
+	if (transport_set_baudrate(dev->transport, baud))
+		errx(EXIT_FAILURE, "Can't set the host UART baudrate: %s",
+		     dev->transport->error);
 }
 
 static void set_chip_profile(struct device *dev, uint8_t family, uint8_t type)
 {
 	const struct ch_profile *profile = profiles;
-
+	dev->family = family;
+	dev->type = type;
 	while (profile->name) {
 		if (profile->family == family && profile->type == type) {
 			dev->profile = profile;
@@ -504,7 +309,7 @@ static void load_file(struct device *dev, struct content *info)
 	off_t total_read = 0;
 	int open_flags = O_RDONLY;
 
-#ifdef WIN32
+#ifdef _WIN32
 	open_flags |= O_BINARY;
 #endif
 
@@ -755,7 +560,11 @@ static void read_data_flash(struct device *dev)
 
 		req.len = len;
 
-		ret = transfer(dev, &req, sizeof(req), &resp, sizeof(resp));
+		/* The final response contains only the requested data, not the
+		 * unused tail of resp.data. USB packet padding is handled below
+		 * the protocol layer. */
+		ret = transfer(dev, &req, sizeof(req), &resp,
+			       sizeof(resp) - sizeof(resp.data) + len);
 		if (ret)
 			errx(EXIT_FAILURE, "Data read failure at offset %d", offset);
 
@@ -836,18 +645,15 @@ int main(int argc, char *argv[])
 	bool do_data_dump = false;
 	int c;
 	int i;
-#ifndef WIN32
-	char *port = NULL;
-#endif
+	const char *port = NULL;
+	const char *backend = NULL;
+	uint32_t baudrate = UART_DEFAULT_BAUD;
 
 	while (1) {
 		int option_index = 0;
 
-		c = getopt_long(argc, argv, "c:df:hk:l:m:s:u:vw:"
-#ifndef WIN32
-				"p:"
-#endif
-				, long_options, &option_index);
+		c = getopt_long(argc, argv, "c:df:hk:l:m:u:vw:p:s:t:",
+				long_options, &option_index);
 		if (c == -1)
 			break;
 
@@ -883,23 +689,19 @@ int main(int argc, char *argv[])
 			dev.data_dump.filename = optarg;
 			do_data_dump = true;
 			break;
-		case 's':
-			c = strtoul(optarg, NULL, 10);
-			if (c == 115200)
-				break;
-			for (i = 0; i < ARRAY_SIZE(baudrates); i++)	{
-				if (baudrates[i].baudrate == c) {
-					dev.upd_baudrate = true;
-					dev.baud.baudrate = c;
-					dev.baud.baud_param_ioterm = baudrates[i].baud_param_ioterm;
-					break;
-				}
-			}
-			if (!dev.upd_baudrate) {
-				printf("Illegal param value for Baudrate\n");
-				return EXIT_FAILURE;
-			}
+		case 's': {
+			char *end;
+			unsigned long value;
+
+			errno = 0;
+			value = strtoul(optarg, &end, 10);
+			if (errno || *optarg == '-' || end == optarg || *end ||
+			    value == 0 || value > UINT32_MAX)
+				errx(EXIT_FAILURE, "Invalid UART baudrate: %s", optarg);
+			baudrate = (uint32_t)value;
+			dev.upd_baudrate = true;
 			break;
+		}
 		case 'u':
 			dev.upd_cfg_user_bits = true;
 			dev.cfg_user_bits = strtoul(optarg, NULL, 16);
@@ -908,11 +710,12 @@ int main(int argc, char *argv[])
 			dev.upd_protection_bits = true;
 			dev.cfg_protection_bits = strtoul(optarg, NULL, 16);
 			break;
-#ifndef WIN32
 		case 'p':
 			port = optarg;
 			break;
-#endif
+		case 't':
+			backend = optarg;
+			break;
 		case 'v':
 			printf("isp-%s\n", PACKAGE_VERSION);
 			return EXIT_SUCCESS;
@@ -927,21 +730,25 @@ int main(int argc, char *argv[])
 	if (optind < argc)
 		errx(EXIT_FAILURE, "Extra argument: %s", argv[optind]);
 
-#ifndef WIN32
-	if (port) {
-		open_serial_device(&dev, port);
-
-		if (dev.upd_baudrate)
-			change_uart_baudrate(&dev);
+	if (!backend)
+		backend = port ? "uart" : "libusb";
+	if (!strcmp(backend, "uart")) {
+		if (!port || !*port)
+			errx(EXIT_FAILURE, "UART backend requires --port");
+		/* Validate before opening a port or sending device commands. */
+		if (!transfer_uart_ops.supports_baudrate(baudrate))
+			errx(EXIT_FAILURE, "Unsupported UART baudrate: %lu",
+			     (unsigned long)baudrate);
+	} else if (port || dev.upd_baudrate) {
+		errx(EXIT_FAILURE, "--port and --speed require the UART backend");
 	}
-	else
-#endif
-
-#if (!defined(WITHOUT_USB) || (WITHOUT_USB == 0))
-		open_usb_device(&dev);
-#else
-		printf("Serial port is not specified\n");
-#endif
+	if (atexit(close_connection))
+		errx(EXIT_FAILURE, "Can't register transport cleanup");
+	dev.transport = &connection;
+	if (transport_open(dev.transport, backend, port, dev.debug))
+		errx(EXIT_FAILURE, "%s", dev.transport->error);
+	if (!strcmp(backend, "uart") && baudrate != UART_DEFAULT_BAUD)
+		change_uart_baudrate(&dev, baudrate);
 
 	read_chip_type(&dev);
 	printf("Found device %s\n", dev.profile->name);
@@ -965,7 +772,9 @@ int main(int argc, char *argv[])
 	switch (dev.bv) {
 	case 0x020301:
 	case 0x020400:
-		dev.wait_reboot_resp = false;
+		if(dev.family <= 0x15) {
+			dev.wait_reboot_resp = false;
+		}
 		break;
 
 	case 0x020500:
@@ -977,7 +786,7 @@ int main(int argc, char *argv[])
 		break;
 
 	default:
-		errx(EXIT_FAILURE, "This bootloader version is not supported");
+		warn("This bootloader version may not supported");
 	}
 
 	create_key(&dev);
@@ -1034,13 +843,8 @@ int main(int argc, char *argv[])
 		printf("Dumped data flash to file\n");
 	}
 
-#ifndef WIN32
-	if (port && dev.upd_baudrate) {
-		dev.baud.baudrate = 115200;
-		dev.baud.baud_param_ioterm = B115200;
-		change_uart_baudrate(&dev);
-	}
-#endif
+	if (!strcmp(backend, "uart") && baudrate != UART_DEFAULT_BAUD)
+		change_uart_baudrate(&dev, UART_DEFAULT_BAUD);
 
 	if (do_code_flash)
 		reboot_device(&dev);
