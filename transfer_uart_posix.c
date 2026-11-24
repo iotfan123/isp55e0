@@ -38,7 +38,6 @@
 #if defined(__linux__) && \
 	(defined(__i386__) || defined(__x86_64__) || defined(__arm__) || \
 	 defined(__aarch64__) || defined(__riscv) || defined(__s390x__))
-#define ISP_UART_BOTHER
 #define ISP_UART_CBAUD     0x100fu
 #define ISP_UART_BOTHER    0x1000u
 #define ISP_UART_TCGETS2   0x802c542au
